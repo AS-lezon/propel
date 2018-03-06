@@ -40,8 +40,7 @@ const rpc = new SandboxRPC(window.parent, {
     lastExecutedCellId = cellId;
     try {
       const console = new Console(rpc, cellId);
-      source = transpile(source);
-      source += `\n//# sourceURL=__cell${cellId}__.js`;
+      source = transpile(source, `__cell${cellId}__.js`);
       const fn = globalEval(source);
       const result = await fn(global, importModule, console);
       if (result !== undefined) {

@@ -68,6 +68,10 @@ function createIframe(): Window {
   return iframe.contentWindow;
 }
 
+if (IS_WEB) {
+  window.fetch("http://localhost:12345/foo", { mode: "cors" }).then(console.log).catch(console.log);
+}
+
 function createSandbox(context: Window): SandboxRPC {
   const sandbox = new SandboxRPC(context, {
     console(cellId: number, ...args: string[]): void {
@@ -160,6 +164,7 @@ export class Cell extends Component<CellProps, CellState> {
   }
 
   get code(): string {
+    if (this.editor) console.log("editor", this.editor.getValue());
     return normalizeCode(this.editor ? this.editor.getValue()
                                      : this.props.code);
   }
@@ -190,6 +195,7 @@ export class Cell extends Component<CellProps, CellState> {
   // Because CodeMirror has a lot of state that is not managed through
   // React, manually apply prop changes.
   componentWillReceiveProps(nextProps: CellProps) {
+    console.log("update", nextProps.code);
     const nextCode = normalizeCode(nextProps.code);
     if (nextCode !== this.code) {
       this.editor.setValue(nextCode);
@@ -278,7 +284,7 @@ export class Cell extends Component<CellProps, CellState> {
     this.clearOutput();
     const classList = (this.input.parentNode as HTMLElement).classList;
     classList.add("notebook-cell-running");
-
+console.log("run", this.code);
     await sandbox().call("runCell", this.code, this.id);
 
     classList.add("notebook-cell-updating");
