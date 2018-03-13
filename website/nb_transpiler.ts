@@ -225,59 +225,128 @@ function parseAsyncWrapped(src) {
   return { body, root };
 }
 
-// Transpiles a repl cell into an async function expression.
-// The returning string has the form:
-//   (async (global, import) => {
-//     ... cell statements
-//     return last_expression_result;
-//   })
-export function transpile(code: string, name: string = null): string {
-  let source: MappedString = new SourceFile(name, code);
-  let body, root;
-  let edit: EditHelper;
+export class Transpiler {
+  private history = new Map<number, MappedString>();
+  private counter = 0;
 
-  // Wrap the source in an async function.
-  source = new MappedString(
-    `(async function (${globalVar}, ${importFn}, console) {\n`
-  )
-    .concat(source)
-    .concat(new MappedString(`\n})//# sourceUrl=${name}`));
+  // Transpiles a repl cell into an async function expression.
+  // The returning string has the form:
+  //   (async (global, import) => {
+  //     ... cell statements
+  //     return last_expression_result;
+  //   })
+  transpile(code: string, name: string = null): string {
+    const id = ++this.counter;
+    let source: MappedString = new SourceFile(name, code);
+    let body, root;
+    let edit: EditHelper;
 
-  // Translate imports into async imports.
-  edit = new EditHelper(source);
-  ({ body, root } = parseAsyncWrapped(source.toString()));
-  walk.recursive(body, { edit }, importVisitors);
-  source = edit.getResult();
+    // Wrap the source in an async function.
+    source = new MappedString().concat(
+      `(async function __transpiled_top_level_${id}__`,
+      `(${globalVar}, ${importFn}, console) {\n`,
+      source,
+      `\n})\n//# sourceURL=__transpiled_source_${id}__`
+    );
 
-  // Translate variable declarations into global assignments.
-  edit = new EditHelper(source);
-  ({ body, root } = parseAsyncWrapped(source.toString()));
-  walkRecursiveWithAncestors(
-    body,
-    {
+    // Translate imports into async imports.
+    edit = new EditHelper(source);
+    ({ body, root } = parseAsyncWrapped(source.toString()));
+    walk.recursive(body, { edit }, importVisitors);
+    source = edit.getResult();
+
+    // Translate variable declarations into global assignments.
+    edit = new EditHelper(source);
+    ({ body, root } = parseAsyncWrapped(source.toString()));
+    walkRecursiveWithAncestors(
       body,
-      edit,
-      translatingVariableDeclaration: false
-    },
-    evalScopeVisitors
-  );
+      {
+        body,
+        edit,
+        translatingVariableDeclaration: false
+      },
+      evalScopeVisitors
+    );
 
-  // If the last statement is an expression, turn it into a return statement.
-  if (body.body.length > 0) {
-    const last = body.body[body.body.length - 1];
-    if (last.type === "ExpressionStatement") {
-      edit.insertBefore(last, "return (");
-      edit.insertAfter(last.expression, ")");
+    // If the last statement is an expression, turn it into a return statement.
+    if (body.body.length > 0) {
+      const last = body.body[body.body.length - 1];
+      if (last.type === "ExpressionStatement") {
+        edit.insertBefore(last, "return (");
+        edit.insertAfter(last.expression, ")");
+      }
     }
+
+    source = edit.getResult();
+
+    // Store the transpilation result so we can map stack traces to their
+    // untranspiled counterparts.
+    this.history.set(id, source);
+
+    return source.toString();
   }
 
-  const mappedStr = edit.getResult();
-  let transpiledSource = mappedStr.toString();
-  if (name != null) {
-    transpiledSource += "\n" + "//# sourceURL=transpiled.js";
+  formatErrorStack(error: Error) {
+    let msg = error.stack;
+
+    // Find the frame that corresponds with the async function wrapper that was
+    // added around the source code. Rename it to "top level" and cut the stack
+    // after it.
+    const topLevelRe = /__transpiled_top_level_\d+__/;
+    const frames = [];
+    for (const frame of msg.split(/\r?\n/)) {
+      if (!topLevelRe.test(frame)) {
+        frames.push(frame);
+      } else {
+        frames.push(frame.replace(topLevelRe, "top level"));
+        break;
+      }
+    }
+    msg = frames.join("\n");
+
+    // To the extent possible, map locations in the transpiled source code
+    // to locations in the original source.
+    msg = msg.replace(
+      /(?:__transpiled_source_(\d+)__)(?::(\d+))?(?::(\d+))?/g,
+      (substr, id, line, column) => {
+        // Note that line/columns numbers in the stack trace are 1-based, but
+        // MappedString positions are zero-based.
+        // Also note that position information may not be available at all, e.g.
+        // on Safari. In that case make a best guess.
+        let source = this.history.get(+id);
+        if (source && line != null) {
+          line = +line;
+          source = source.split("\n", line)[line - 1];
+        }
+        if (source && column != null) {
+          column = +column;
+          source = source.slice(column - 1);
+        }
+        if (source) {
+          for (const char of source) {
+            if (char.file) {
+              return (
+                char.file.name +
+                (line != null
+                  ? `:${char.line + 1}` +
+                    (column != null ? `:${char.column + 1}` : "")
+                  : "")
+              );
+            }
+          }
+        }
+        // If source information couldn't be found, return the unmodified
+        // matched substring.
+        return substr;
+      }
+    );
+    // Some browsers (Chrome) include the error message in the stack, whil
+    // others (Firefox) don't.
+    if (msg.indexOf(error.message) === -1) {
+      msg = `${error.constructor.name}: ${error.message}\n${msg}`;
+    }
+    return msg;
   }
-  console.log(transpiledSource);
-  return transpiledSource;
 }
 
 interface Position {
@@ -300,22 +369,26 @@ class MappedChar implements Position {
   }
 }
 
+type MappedStringLike = string | MappedChar[] | MappedString;
+
 class MappedString extends Array<MappedChar> {
   static EMPTY = new MappedString();
 
-  static convert(str: MappedStringLike, pos: Position = {}): MappedString {
+  static convert(str: any, pos: Position = {}): MappedString {
     if (str instanceof MappedString) {
       return str;
+    } else if (str instanceof Array) {
+      return new MappedString(str);
     } else {
       return new MappedString(
-        Array.from(str).map(char => new MappedChar(char, pos))
+        Array.from("" + str).map(char => new MappedChar(char, pos))
       );
     }
   }
 
   constructor(chars: number | string | MappedChar[] = [], pos?: Position) {
     if (typeof chars === "number") {
-      super(chars);
+      super();
     } else if (typeof chars === "string") {
       super(...Array.from(chars).map(char => new MappedChar(char, pos)));
     } else {
@@ -323,20 +396,44 @@ class MappedString extends Array<MappedChar> {
     }
   }
 
-  // Should not need to implement this method; engines that support ES6
-  // classes already do the right thing when we don't overload
-  // Array.prototype.concat.
-  concat(...parts: MappedString[]): MappedString {
-    let str = Array.prototype.concat.apply(this, arguments);
-    // Workaround for ES5.
-    if (!(str instanceof MappedString)) {
-      str = new MappedString(str);
-    }
-    return str;
+  concat(...parts: any[]): MappedString {
+    parts = parts.map(part => MappedString.convert(part));
+    return Array.prototype.concat.apply(this, parts);
   }
 
-  split(): MappedString[] {
-    return Array.from(this).map(c => new MappedString([c]));
+  slice(start: number, end?: number): MappedString {
+    return Array.prototype.slice.call(this, start, end);
+  }
+
+  split(separator: string, limit?: number): MappedString[] {
+    if (limit === undefined) {
+      limit = this.length;
+    }
+
+    // N.b.: unlike String, MappedString does not support regex as a separator.
+    if (separator === "") {
+      return Array.from(this)
+        .slice(0, limit)
+        .map(c => new MappedString([c]));
+    }
+
+    const result: MappedString[] = [];
+    let remainingText: string = this.toString();
+    let remainingChars: MappedString = this;
+
+    while (limit === undefined || result.length < limit) {
+      const pos = remainingText.indexOf(separator);
+      if (pos < 0) {
+        result.push(remainingChars);
+        break;
+      }
+
+      result.push(remainingChars.slice(0, pos));
+      remainingChars = remainingChars.slice(pos + separator.length);
+      remainingText = remainingText.slice(pos + separator.length);
+    }
+
+    return result;
   }
 
   toString(): string {
@@ -364,13 +461,11 @@ class SourceFile extends MappedString {
   }
 }
 
-type MappedStringLike = string | MappedString;
-
 class EditHelper {
   private index: MappedString[];
 
   constructor(source: MappedStringLike) {
-    this.index = MappedString.convert(source).split();
+    this.index = MappedString.convert(source).split("");
   }
 
   getResult(): MappedString {
